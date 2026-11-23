@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>五端口虚拟交换机实验台</title>
+<style>
+  :root { --bg:#0f1420; --card:#1a2233; --line:#2a3550; --fg:#dfe6f3;
+          --dim:#8b97b0; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; --acc:#60a5fa; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 "Segoe UI",system-ui,sans-serif; }
+  header { display:flex; align-items:center; gap:16px; padding:12px 20px;
+           background:var(--card); border-bottom:1px solid var(--line); }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--dim); }
+  main { padding:16px 20px; display:flex; flex-direction:column; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line);
+          border-radius:10px; padding:14px 16px; }
+  .card h2 { font-size:15px; margin:0 0 10px; }
+  .card h3 { font-size:14px; margin:0 0 8px; display:flex; gap:8px; align-items:center; }
+  .card h4 { font-size:12px; color:var(--dim); margin:10px 0 4px; }
+  button { background:var(--acc); color:#0b1020; border:0; border-radius:6px;
+           padding:5px 12px; cursor:pointer; font-weight:600; }
+  button.ghost { background:#2a3550; color:var(--fg); }
+  button.warn { background:var(--warn); }
+  button:hover { filter:brightness(1.1); }
+  input, select { background:#0d1322; color:var(--fg); border:1px solid var(--line);
+                  border-radius:6px; padding:4px 8px; }
+  input[type=number] { width:80px; }
+  label { display:inline-flex; align-items:center; gap:6px; margin-right:14px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; }
+  #ports { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:12px; }
+  .badge { font-size:11px; padding:1px 8px; border-radius:99px; }
+  .badge.on { background:#134e2a; color:var(--ok); }
+  .badge.off { background:#4a3413; color:var(--warn); }
+  .mono, ul.frames { font-family:ui-monospace,Consolas,monospace; }
+  ul.frames { list-style:none; margin:0; padding:0; max-height:150px; overflow:auto;
+              font-size:12px; }
+  ul.frames li { padding:2px 6px; border-bottom:1px dashed var(--line);
+                 word-break:break-all; }
+  ul.frames li small { color:var(--dim); }
+  #log { max-height:220px; overflow:auto; font-size:12px;
+         font-family:ui-monospace,Consolas,monospace; }
+  #log div { padding:1px 0; border-bottom:1px dotted #223; }
+  #log span.t { color:var(--dim); margin-right:8px; }
+  .msg { margin-top:8px; font-size:13px; min-height:18px; }
+  .msg.err { color:var(--bad); }
+  .msg.ok { color:var(--ok); }
+  table.mact { border-collapse:collapse; margin:4px 0 10px; font-size:13px; }
+  table.mact td, table.mact th { border:1px solid var(--line); padding:2px 10px; }
+  table.mact th { color:var(--dim); font-weight:600; }
+  .vlanTitle { color:var(--acc); font-weight:700; }
+  .counts { color:var(--dim); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>五端口虚拟交换机</h1>
+  <span class="sub">按 VLAN 独立学习 MAC · 未知单播只泛洪本 VLAN · 暂停/放行出帧 · 带积压改配</span>
+  <span style="flex:1"></span>
+  <button class="warn" id="resetBtn">复位交换机</button>
+</header>
+<main>
+  <section class="card">
+    <h2>发送单播帧</h2>
+    <div class="row">
+      <label>入端口 <select id="fPort"></select></label>
+      <label>源 MAC <input id="fSrc" class="mono" size="18" value="02:00:00:00:00:01"></label>
+      <label>目的 MAC <input id="fDst" class="mono" size="18" value="02:00:00:00:00:02"></label>
+      <label>数据 <input id="fPayload" size="16" value="hello"></label>
+      <button id="sendBtn">发送</button>
+    </div>
+    <div class="msg" id="sendMsg"></div>
+  </section>
+
+  <section id="ports"></section>
+
+  <section class="card">
+    <h2>MAC 地址表（各 VLAN 独立学习）</h2>
+    <div id="macTables" class="mono">（空）</div>
+  </section>
+
+  <section class="card">
+    <h2>事件日志</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+const NPORTS = 5;
+const $ = (id) => document.getElementById(id);
+function el(tag, text, cls) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+}
+async function post(path, body) {
+  const opt = {method: "POST", headers: {"Content-Type": "application/json"}};
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+
+let lastState = null;
+
+// ---------- 端口卡片（一次性构建，之后只更新动态内容，避免打断输入） ----------
+function buildPorts() {
+  const box = $("ports");
+  for (let i = 1; i <= NPORTS; i++) {
+    const card = el("section", null, "card");
+    const h3 = el("h3", "端口 " + i + " ");
+    const badge = el("span", "", "badge"); badge.id = "badge" + i;
+    h3.appendChild(badge);
+    card.appendChild(h3);
+
+    const row1 = el("div", null, "row");
+    row1.appendChild(el("span", "VLAN"));
+    const vin = el("input"); vin.type = "number"; vin.min = 1; vin.max = 4094;
+    vin.id = "vlan" + i;
+    row1.appendChild(vin);
+    const apply = el("button", "改配"); apply.className = "ghost";
+    apply.onclick = () => changeVlan(i);
+    row1.appendChild(apply);
+    const toggle = el("button", ""); toggle.id = "toggle" + i;
+    toggle.onclick = () => togglePause(i);
+    row1.appendChild(toggle);
+    card.appendChild(row1);
+
+    const counts = el("div", "", "counts"); counts.id = "counts" + i;
+    card.appendChild(counts);
+
+    card.appendChild(el("h4", "待发队列（积压）"));
+    const q = el("ul", null, "frames"); q.id = "queue" + i; card.appendChild(q);
+    card.appendChild(el("h4", "已收到的帧"));
+    const rv = el("ul", null, "frames"); rv.id = "recv" + i; card.appendChild(rv);
+    box.appendChild(card);
+  }
+}
+
+function frameLi(f) {
+  const li = el("li");
+  li.appendChild(el("span", "#" + f.seq + " " + f.src + " → " + f.dst));
+  li.appendChild(el("small", ' "' + f.payload + '" vlan' + f.vlan + " 入端口" + f.ingress));
+  return li;
+}
+
+function render(st) {
+  lastState = st;
+  for (const p of st.ports) {
+    const i = p.id;
+    const badge = $("badge" + i);
+    badge.textContent = p.paused ? "已暂停" : "转发中";
+    badge.className = "badge " + (p.paused ? "off" : "on");
+    $("toggle" + i).textContent = p.paused ? "放行出帧" : "暂停出帧";
+    $("toggle" + i).className = p.paused ? "" : "ghost";
+    const vin = $("vlan" + i);
+    if (document.activeElement !== vin) vin.value = p.vlan;
+    $("counts" + i).textContent =
+      "VLAN " + p.vlan + " · 积压 " + p.queued + " · 已收 " + p.received_count +
+      " · 改配丢弃累计 " + p.dropped_total;
+
+    const q = $("queue" + i); q.textContent = "";
+    p.queue.forEach(f => q.appendChild(frameLi(f)));
+    const rv = $("recv" + i); rv.textContent = "";
+    p.received.slice(-10).reverse().forEach(f => rv.appendChild(frameLi(f)));
+  }
+
+  const mt = $("macTables"); mt.textContent = "";
+  const vlans = Object.keys(st.mac_tables);
+  if (!vlans.length) mt.textContent = "（空）";
+  vlans.forEach(v => {
+    mt.appendChild(el("div", "VLAN " + v, "vlanTitle"));
+    const t = el("table", null, "mact");
+    const hd = el("tr"); hd.appendChild(el("th", "MAC")); hd.appendChild(el("th", "端口"));
+    t.appendChild(hd);
+    Object.entries(st.mac_tables[v]).forEach(([mac, port]) => {
+      const tr = el("tr");
+      tr.appendChild(el("td", mac)); tr.appendChild(el("td", "端口 " + port));
+      t.appendChild(tr);
+    });
+    mt.appendChild(t);
+  });
+
+  const lg = $("log"); lg.textContent = "";
+  st.log.forEach(e => {
+    const d = el("div");
+    d.appendChild(el("span", e.t, "t"));
+    d.appendChild(el("span", e.msg));
+    lg.appendChild(d);
+  });
+}
+
+async function refresh() {
+  try { render(await (await fetch("/api/state")).json()); }
+  catch (e) { /* 服务重启中等情况，下一轮再试 */ }
+}
+
+function flash(id, text, ok) {
+  const m = $(id); m.textContent = text; m.className = "msg " + (ok ? "ok" : "err");
+}
+
+// ---------- 动作 ----------
+async function sendFrame() {
+  try {
+    const r = await post("/api/frame", {
+      port: +$("fPort").value, src: $("fSrc").value,
+      dst: $("fDst").value, payload: $("fPayload").value,
+    });
+    const bits = ["动作: " + r.action];
+    if (r.delivered.length) bits.push("已交付端口 " + r.delivered.join(","));
+    if (r.queued.length) bits.push("积压于端口 " + r.queued.join(","));
+    flash("sendMsg", "帧#" + r.frame.seq + " — " + bits.join("；"), true);
+  } catch (e) { flash("sendMsg", e.message, false); }
+  refresh();
+}
+
+async function changeVlan(i) {
+  const vlan = +$("vlan" + i).value;
+  const p = lastState && lastState.ports.find(x => x.id === i);
+  if (p && p.queued > 0 && p.vlan !== vlan &&
+      !confirm("端口 " + i + " 有 " + p.queued + " 帧积压，改配生效后这些待发帧与指向本口的学习项将同时失效。继续？")) {
+    return;
+  }
+  try {
+    const r = await post("/api/port/" + i + "/vlan", {vlan});
+    flash("sendMsg", r.changed
+      ? "端口 " + i + " 改配 vlan " + r.old_vlan + " → " + r.vlan +
+        "；失效学习项 " + r.purged_entries.length + " 条，丢弃积压 " + r.dropped_queue + " 帧"
+      : "端口 " + i + " VLAN 未变化", true);
+  } catch (e) { flash("sendMsg", e.message, false); }
+  refresh();
+}
+
+async function togglePause(i) {
+  const p = lastState && lastState.ports.find(x => x.id === i);
+  try {
+    if (p && p.paused) {
+      const r = await post("/api/port/" + i + "/release");
+      flash("sendMsg", "端口 " + i + " 已放行，交付积压 " + r.delivered + " 帧", true);
+    } else {
+      await post("/api/port/" + i + "/pause");
+      flash("sendMsg", "端口 " + i + " 已暂停出帧", true);
+    }
+  } catch (e) { flash("sendMsg", e.message, false); }
+  refresh();
+}
+
+$("resetBtn").onclick = async () => {
+  if (!confirm("复位将清空全部端口状态、MAC 表与日志，继续？")) return;
+  await post("/api/reset"); refresh();
+};
+$("sendBtn").onclick = sendFrame;
+
+// ---------- 初始化 ----------
+(function init() {
+  const sel = $("fPort");
+  for (let i = 1; i <= NPORTS; i++) sel.appendChild(el("option", i));
+  buildPorts();
+  refresh();
+  setInterval(refresh, 1000);
+})();
+</script>
+</body>
+</html>

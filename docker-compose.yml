@@ -1,0 +1,8 @@
+services:
+  switch:
+    build: .
+    image: vlan-switch
+    container_name: vlan-switch
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
