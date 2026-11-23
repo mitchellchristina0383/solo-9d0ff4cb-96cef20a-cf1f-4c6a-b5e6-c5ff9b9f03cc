@@ -52,16 +52,33 @@
   table.mact th { color:var(--dim); font-weight:600; }
   .vlanTitle { color:var(--acc); font-weight:700; }
   .counts { color:var(--dim); font-size:12px; }
+  .badge.lag { background:#1e3a5f; color:var(--acc); }
+  .badge.down { background:#4a1f1f; color:var(--bad); }
+  .drillbox { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; }
+  .drillbox .status { font-size:13px; }
+  button.bad { background:var(--bad); color:#1a0606; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .lagtag { color:var(--acc); font-size:12px; margin-left:6px; }
 </style>
 </head>
 <body>
 <header>
   <h1>五端口虚拟交换机</h1>
-  <span class="sub">按 VLAN 独立学习 MAC · 未知单播只泛洪本 VLAN · 暂停/放行出帧 · 带积压改配</span>
+  <span class="sub">按 VLAN 独立学习 MAC · 未知单播只泛洪本 VLAN · 暂停/放行出帧 · 带积压改配 · 双链路聚合演练</span>
   <span style="flex:1"></span>
   <button class="warn" id="resetBtn">复位交换机</button>
 </header>
 <main>
+  <section class="card">
+    <h2>双链路演练（聚合口）</h2>
+    <div class="drillbox">
+      <button id="drillStartBtn">开始演练：复位并把 4、5 号口绑成聚合口（固定 VLAN 1）</button>
+      <button class="ghost" id="drillStopBtn">结束演练：拆除聚合口</button>
+      <span class="status" id="drillStatus">未开始</span>
+    </div>
+    <div class="msg" id="drillMsg"></div>
+  </section>
+
   <section class="card">
     <h2>发送单播帧</h2>
     <div class="row">
@@ -123,11 +140,16 @@ function buildPorts() {
     vin.id = "vlan" + i;
     row1.appendChild(vin);
     const apply = el("button", "改配"); apply.className = "ghost";
+    apply.id = "vlanBtn" + i;
     apply.onclick = () => changeVlan(i);
     row1.appendChild(apply);
     const toggle = el("button", ""); toggle.id = "toggle" + i;
     toggle.onclick = () => togglePause(i);
     row1.appendChild(toggle);
+    const linkBtn = el("button", ""); linkBtn.id = "linkBtn" + i;
+    linkBtn.className = "bad";
+    linkBtn.onclick = () => toggleLink(i);
+    row1.appendChild(linkBtn);
     card.appendChild(row1);
 
     const counts = el("div", "", "counts"); counts.id = "counts" + i;
@@ -148,25 +170,68 @@ function frameLi(f) {
   return li;
 }
 
+function epName(ep) {
+  return ep === "lag1" ? "聚合口 lag1" : "端口 " + ep;
+}
+
 function render(st) {
   lastState = st;
   for (const p of st.ports) {
     const i = p.id;
     const badge = $("badge" + i);
-    badge.textContent = p.paused ? "已暂停" : "转发中";
-    badge.className = "badge " + (p.paused ? "off" : "on");
-    $("toggle" + i).textContent = p.paused ? "放行出帧" : "暂停出帧";
-    $("toggle" + i).className = p.paused ? "" : "ghost";
+    if (p.link_down) {
+      badge.textContent = "链路断开"; badge.className = "badge down";
+    } else if (p.agg_member) {
+      badge.textContent = "聚合成员 " + p.agg_member + (p.paused ? " · 已暂停" : " · 转发中");
+      badge.className = "badge lag" + (p.paused ? " off" : "");
+    } else {
+      badge.textContent = p.paused ? "已暂停" : "转发中";
+      badge.className = "badge " + (p.paused ? "off" : "on");
+    }
+    const toggle = $("toggle" + i);
+    toggle.textContent = p.paused ? "放行出帧" : "暂停出帧";
+    toggle.className = p.paused ? "" : "ghost";
+    toggle.disabled = !!p.link_down;
+    const linkBtn = $("linkBtn" + i);
+    linkBtn.style.display = p.agg_member ? "" : "none";
+    linkBtn.textContent = p.link_down ? "恢复链路" : "断开链路";
+    linkBtn.disabled = !p.agg_member;
     const vin = $("vlan" + i);
     if (document.activeElement !== vin) vin.value = p.vlan;
+    vin.disabled = !!p.agg_member;
+    $("vlanBtn" + i).disabled = !!p.agg_member;
+    const lagTag = document.getElementById("lagtag" + i);
+    if (p.agg_member && !lagTag) {
+      const t = el("span", "[" + p.agg_member + " 成员]", "lagtag");
+      t.id = "lagtag" + i;
+      $("badge" + i).after(t);
+    } else if (!p.agg_member && lagTag) {
+      lagTag.remove();
+    }
     $("counts" + i).textContent =
       "VLAN " + p.vlan + " · 积压 " + p.queued + " · 已收 " + p.received_count +
-      " · 改配丢弃累计 " + p.dropped_total;
+      " · 改配丢弃累计 " + p.dropped_total +
+      (p.link_down ? " · 链路断开（仅存活成员收发）" : "");
 
     const q = $("queue" + i); q.textContent = "";
     p.queue.forEach(f => q.appendChild(frameLi(f)));
     const rv = $("recv" + i); rv.textContent = "";
     p.received.slice(-10).reverse().forEach(f => rv.appendChild(frameLi(f)));
+  }
+
+  // 演练状态条
+  const ds = $("drillStatus");
+  if (st.agg) {
+    ds.textContent =
+      "演练中：聚合口 " + st.agg.id + " 固定 VLAN " + st.agg.vlan +
+      "，成员端口 " + st.agg.members.join("、") +
+      "，存活 " + st.agg.active.join("、") +
+      (st.agg.down.length ? "，断开 " + st.agg.down.join("、") : "，双线正常") +
+      "，聚合口丢弃累计 " + st.agg.dropped_total;
+    ds.style.color = "var(--acc)";
+  } else {
+    ds.textContent = "未开始（点击开始将先复位整机）";
+    ds.style.color = "var(--dim)";
   }
 
   const mt = $("macTables"); mt.textContent = "";
@@ -175,11 +240,11 @@ function render(st) {
   vlans.forEach(v => {
     mt.appendChild(el("div", "VLAN " + v, "vlanTitle"));
     const t = el("table", null, "mact");
-    const hd = el("tr"); hd.appendChild(el("th", "MAC")); hd.appendChild(el("th", "端口"));
+    const hd = el("tr"); hd.appendChild(el("th", "MAC")); hd.appendChild(el("th", "学习端口"));
     t.appendChild(hd);
-    Object.entries(st.mac_tables[v]).forEach(([mac, port]) => {
+    Object.entries(st.mac_tables[v]).forEach(([mac, ep]) => {
       const tr = el("tr");
-      tr.appendChild(el("td", mac)); tr.appendChild(el("td", "端口 " + port));
+      tr.appendChild(el("td", mac)); tr.appendChild(el("td", epName(ep)));
       t.appendChild(tr);
     });
     mt.appendChild(t);
@@ -213,6 +278,9 @@ async function sendFrame() {
     const bits = ["动作: " + r.action];
     if (r.delivered.length) bits.push("已交付端口 " + r.delivered.join(","));
     if (r.queued.length) bits.push("积压于端口 " + r.queued.join(","));
+    if (r.lag_egress !== null && r.lag_egress !== undefined)
+      bits.push("聚合口分流到端口 " + r.lag_egress);
+    if (r.lag_dropped) bits.push("聚合口双线均断，副本丢弃");
     flash("sendMsg", "帧#" + r.frame.seq + " — " + bits.join("；"), true);
   } catch (e) { flash("sendMsg", e.message, false); }
   refresh();
@@ -248,6 +316,42 @@ async function togglePause(i) {
   } catch (e) { flash("sendMsg", e.message, false); }
   refresh();
 }
+
+async function toggleLink(i) {
+  const p = lastState && lastState.ports.find(x => x.id === i);
+  const down = !(p && p.link_down);
+  try {
+    const r = await post("/api/port/" + i + "/link", {down});
+    flash("drillMsg", down
+      ? "端口 " + i + " 链路断开：仅存活成员收发，学习项仍指向 lag1；" +
+        r.merged + " 帧待发按帧号并入存活成员（即时交付 " + r.flushed + " 帧，已交付帧不重发）"
+      : "端口 " + i + " 链路恢复，存活成员 " + r.agg.active.join("、") +
+        "，恢复双线哈希分流", true);
+  } catch (e) { flash("drillMsg", e.message, false); }
+  refresh();
+}
+
+$("drillStartBtn").onclick = async () => {
+  if (!confirm("开始演练将复位整机（清空全部状态、MAC 表与日志），并把 4、5 号口绑成固定 VLAN 1 的聚合口。继续？")) return;
+  try {
+    const r = await post("/api/drill/start");
+    flash("drillMsg", "演练开始：端口 " + r.agg.members.join("、") +
+      " 已绑定为聚合口 " + r.agg.id + "（固定 VLAN " + r.agg.vlan + "）", true);
+  } catch (e) { flash("drillMsg", e.message, false); }
+  refresh();
+};
+
+$("drillStopBtn").onclick = async () => {
+  if (!confirm("结束演练将拆除聚合口：指向 lag1 的学习项失效，成员残留积压丢弃。继续？")) return;
+  try {
+    const r = await post("/api/drill/stop");
+    flash("drillMsg", r.ok
+      ? "演练结束：聚合口已拆除，失效学习项 " + r.purged_entries.length +
+        " 条，丢弃成员积压 " + r.dropped_queue + " 帧"
+      : "演练未开始，无需结束", true);
+  } catch (e) { flash("drillMsg", e.message, false); }
+  refresh();
+};
 
 $("resetBtn").onclick = async () => {
   if (!confirm("复位将清空全部端口状态、MAC 表与日志，继续？")) return;

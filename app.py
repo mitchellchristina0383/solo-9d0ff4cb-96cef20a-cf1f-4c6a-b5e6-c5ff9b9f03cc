@@ -59,6 +59,22 @@ def create_app(switch=None):
     def api_reset():
         return jsonify(sw.reset())
 
+    # ---------- 双链路聚合演练 ----------
+    @app.post("/api/drill/start")
+    def api_drill_start():
+        return jsonify(sw.start_drill())
+
+    @app.post("/api/drill/stop")
+    def api_drill_stop():
+        return jsonify(sw.stop_drill())
+
+    @app.post("/api/port/<int:port_id>/link")
+    def api_set_link(port_id):
+        try:
+            return jsonify(sw.set_link(port_id, bool(body().get("down"))))
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
     return app
 
 

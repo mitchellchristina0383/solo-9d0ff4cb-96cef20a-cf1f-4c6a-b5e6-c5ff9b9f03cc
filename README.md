@@ -15,6 +15,18 @@ Flask 实现的 5 端口 VLAN 感知学习型交换机，供值班员在实验�
   同时失效；切回原 VLAN 也按空队列处理；其他端口积压照常交付
 - 同一端口的改配与放行可并发发起：核心模型用一把可重入锁把所有操作串行化，
   每个操作原子生效
+- 双链路聚合演练：开演即复位整机，把 4、5 号口绑成固定在 VLAN 1 的逻辑聚合口
+  `lag1`，模拟两条线接同一台设备：
+  - 从任一成员口进来的帧，源 MAC 都学到聚合口 `lag1`（不学到物理成员）
+  - 组内收到的帧只向组外转发，不回注另一个成员（hairpin 抑制）
+  - 组外泛洪到聚合口时只发一份，由哈希选定唯一成员口
+  - 发往聚合口的帧按 `(源 MAC, 目的 MAC)` 的 CRC32 哈希在两条线上分流，
+    同一流固定走同一条成员线
+  - 网页可断开任一成员链路：断线后只用存活成员收发，学习项仍指向 `lag1`；
+    断线成员的待发帧按原帧号并入存活成员队列，存活成员暂停时继续等待，
+    放行时按帧号 FIFO 交付；已交付的帧留在实收历史里、绝不重发
+  - 结束演练拆除聚合组：指向 `lag1` 的学习项失效，成员残留积压丢弃，
+    4、5 号口恢复为普通物理口
 
 ## 启动
 
@@ -37,33 +49,44 @@ python app.py          # http://localhost:8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 网页控制台 |
-| GET | `/api/state` | 全部状态（端口、MAC 表、日志） |
+| GET | `/api/state` | 全部状态（端口、MAC 表、聚合组、日志） |
 | POST | `/api/frame` | 发帧 `{port, src, dst, payload}` |
-| POST | `/api/port/<id>/vlan` | 改配 VLAN `{vlan}` |
+| POST | `/api/port/<id>/vlan` | 改配 VLAN `{vlan}`（聚合成员在演练中被拒） |
 | POST | `/api/port/<id>/pause` | 暂停出帧 |
 | POST | `/api/port/<id>/release` | 放行出帧（交付积压） |
-| POST | `/api/reset` | 复位整机 |
+| POST | `/api/port/<id>/link` | 演练断链/恢复 `{down: true|false}`（仅聚合成员） |
+| POST | `/api/drill/start` | 开始演练：复位并把 4、5 口绑成聚合口 `lag1`（VLAN 1） |
+| POST | `/api/drill/stop` | 结束演练：拆除聚合口 |
+| POST | `/api/reset` | 复位整机（同时退出演练） |
 
 错误输入返回 `400 {"error": ...}`。
 
 ## 设计要点
 
 - `switch.py` 为纯模型：`Switch` 持有一把 `threading.RLock`，
-  `send_frame / set_vlan / pause / release / state` 全部在锁内完成，
-  因此改配与放行并发时只是被串行化，不会交错破坏状态。
+  `send_frame / set_vlan / pause / release / set_link / start_drill / stop_drill`
+  全部在锁内完成，因此改配、断链与放行并发时只是被串行化，不会交错破坏状态。
 - `set_vlan` 在同一临界区内依次：改端口 VLAN → 删除所有 VLAN 表中指向
   本口的学习项 → 清空本口积压队列。三者对观察者原子。
-- 学习表按 VLAN 分表（`{vlan: {mac: port}}`），同一 MAC 在不同 VLAN 独立学习；
+- 学习表按 VLAN 分表（`{vlan: {mac: 端口标识}}`），端口标识既可以是物理口号，
+  也可以是聚合口逻辑标识 `lag1`；同一 MAC 在不同 VLAN 独立学习；
   同一 MAC 换端口出现则迁移表项。
+- 聚合转发：转发目标列表中用聚合口端点占位，真正出帧前用
+  `crc32(src+dst) % 存活成员数` 选定唯一物理成员——因此组外泛洪到聚合口
+  天然只有一份，且同流固定一条线；成员口入帧时聚合端点不参与泛洪（组内抑制）。
+- 断链合并（`set_link`）在同一临界区内：标记链路状态 → 把断线口待发队列与
+  存活成员队列合并后按帧号 `seq` 统一排序 → 存活成员未暂停则立即按序交付、
+  暂停则整体继续等待。已在 `received` 中的帧不参与合并，因此不会重发。
 - 不变式（`Switch.check_invariants`，测试与冒烟均断言）：
-  学习项必指向当前处于该 VLAN 的端口；有积压的端口必处于暂停态；
-  积压帧的 VLAN 必等于端口当前 VLAN。
+  学习项必指向当前处于该 VLAN 的物理口或同 VLAN 的聚合口；
+  有积压的普通口必处于暂停态；单链路断线时断链口不得残留积压（已并入存活成员），
+  仅双断（防御场景）允许队列保留；积压帧的 VLAN 必等于端口/聚合口当前 VLAN。
 
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -v   # 单元测试（模型 + API）
-python scripts/smoke_http.py              # 起真实服务跑端到端场景
+python -m unittest discover -s tests -v   # 单元测试（模型 + API，含聚合演练）
+python scripts/smoke_http.py              # 起真实服务跑端到端四个场景
 ```
 
 ## 已知限制
@@ -71,4 +94,6 @@ python scripts/smoke_http.py              # 起真实服务跑端到端场景
 - 使用 Flask 内置开发服务器（threaded），未接 gunicorn 等生产级 WSGI
 - 状态不持久化，进程重启即丢；无认证，仅限实验室使用
 - 只支持单播帧（广播/组播目的被拒绝）；无 STP、无端口镜像等
+- 聚合组固定为 4、5 号口、固定 VLAN 1（演练场景）；哈希只取源、目的 MAC；
+  双链路同时断开为防御场景，新帧丢弃计数、队列保留待恢复
 - 积压队列无长度上限；每端口已收帧历史保留最近 500 条

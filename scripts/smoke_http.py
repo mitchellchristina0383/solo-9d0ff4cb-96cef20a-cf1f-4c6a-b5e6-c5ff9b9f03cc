@@ -160,6 +160,92 @@ def scenario_concurrent():
           [(p["id"], p["queued"], p["paused"]) for p in st["ports"]])
 
 
+def scenario_lag_drill():
+    print("\n== 场景四：双链路聚合演练（学习 / 分流 / 带积压断线） ==")
+    MA, MB, MC, MD = ("02:00:00:00:00:0%d" % i for i in (5, 6, 7, 8))
+    post("/api/reset")
+    _, r = post("/api/drill/start")
+    check("开演即复位并绑定 4、5 口为聚合口 lag1（VLAN1）",
+          r["agg"]["members"] == [4, 5] and r["agg"]["vlan"] == 1, r)
+    st = state()
+    check("成员口状态带上 lag1 标记", all(
+        next(p for p in st["ports"] if p["id"] == i)["agg_member"] == "lag1"
+        for i in (4, 5)), st["ports"])
+
+    # 1) 聚合口学习：两个成员口入帧，源 MAC 都学到 lag1
+    post("/api/frame", {"port": 4, "src": MA, "dst": MB})
+    post("/api/frame", {"port": 5, "src": MA, "dst": MC})
+    st = state()
+    check("从任一成员进来的帧，源 MAC 都学到聚合口 lag1",
+          st["mac_tables"]["1"].get(MA) == "lag1", st["mac_tables"])
+
+    # 2) 组内不回注：成员口入帧泛洪不到另一成员
+    _, r = post("/api/frame", {"port": 4, "src": MA, "dst": MC})
+    check("组内收到的帧只向组外转发（不回注成员5）",
+          r["action"] == "flood" and sorted(r["delivered"]) == [1, 2, 3]
+          and 5 not in r["delivered"], r)
+
+    # 3) 组外泛洪到聚合口只发一份
+    _, r = post("/api/frame", {"port": 1, "src": MB, "dst": MC})
+    agg_hits = [p for p in r["delivered"] if p in (4, 5)]
+    check("组外泛洪到聚合口只发一份", len(agg_hits) == 1, r)
+
+    # 4) 已知单播按 (源,目的) 哈希分流，同流固定一条线
+    post("/api/frame", {"port": 4, "src": MD, "dst": MB})
+    picked = [post("/api/frame", {"port": 1, "src": MB, "dst": MD})[1]["lag_egress"]
+              for _ in range(4)]
+    check("同一流固定走同一条成员线", len(set(picked)) == 1 and picked[0] in (4, 5), picked)
+    used = set()
+    # 目的 MAC 避开已学到端口1的 MB（:06），否则源目相同会被自过滤
+    for i in (1, 2, 3, 4, 5, 7, 8, 9, 10, 11):
+        dst = "02:00:00:00:00:%02x" % i
+        post("/api/frame", {"port": 4, "src": dst, "dst": MB})
+        used.add(post("/api/frame", {"port": 1, "src": MB, "dst": dst})[1]["lag_egress"])
+    check("不同流在两条线上分流", used == {4, 5}, used)
+
+    # 5) 带积压断线：暂停两成员压出双线积压，再断端口4
+    post("/api/port/4/pause")
+    post("/api/port/5/pause")
+    post("/api/frame", {"port": 1, "src": MB, "dst": MA})
+    post("/api/frame", {"port": 1, "src": MB, "dst": MD})
+    st = state()
+    q4 = port(st, 4)["queued"]
+    q5 = port(st, 5)["queued"]
+    check("两条成员线都有积压", q4 > 0 and q5 > 0, (q4, q5))
+    _, r = post("/api/port/4/link", {"down": True})
+    check("断线成员待发帧并入存活成员（按原帧号），存活成员暂停时继续等",
+          r["merged"] == q4 and r["flushed"] == 0, r)
+    st = state()
+    check("断链口队列清空、存活成员积压为两线之和",
+          port(st, 4)["queued"] == 0 and port(st, 5)["queued"] == q4 + q5,
+          (port(st, 4)["queued"], port(st, 5)["queued"]))
+    check("断线后学习项仍指向聚合口 lag1",
+          st["mac_tables"]["1"].get(MA) == "lag1", st["mac_tables"])
+    _, r = post("/api/frame", {"port": 1, "src": MB, "dst": MA})
+    check("断线后新帧只用存活成员5收发", r["lag_egress"] == 5 and r["queued"] == [5], r)
+
+    # 6) 放行存活成员：按帧号 FIFO 交付，已交付帧不重发
+    before = {p: port(state(), p)["received_count"] for p in (4, 5)}
+    _, r = post("/api/port/5/release")
+    check("放行按原帧号交付全部合并积压", r["delivered"] == q4 + q5 + 1, r)
+    st = state()
+    seqs = [f["seq"] for f in port(st, 5)["queue"]]
+    check("放行后存活成员无积压", seqs == [], seqs)
+    check("已交付帧不重发（断链口实收数不变）",
+          port(st, 4)["received_count"] == before[4], before)
+
+    # 7) 恢复链路：重新双线分流
+    post("/api/port/4/link", {"down": False})
+    _, r = post("/api/frame", {"port": 1, "src": MB, "dst": MD})
+    check("恢复后新帧可重新走端口4（双线哈希分流恢复）", r["lag_egress"] in (4, 5), r)
+
+    # 8) 收演拆除
+    _, r = post("/api/drill/stop")
+    check("结束演练：聚合口拆除、lag1 学习项失效",
+          r["ok"] and any(e["mac"] == MA for e in r["purged_entries"]), r)
+    check("结束后状态中不再有聚合组", state()["agg"] is None)
+
+
 def main():
     import logging
     logging.getLogger("werkzeug").setLevel(logging.ERROR)   # 只保留 PASS/FAIL 输出
@@ -171,6 +257,7 @@ def main():
         scenario_same_address_learning()
         scenario_backlog_reconfig()
         scenario_concurrent()
+        scenario_lag_drill()
     finally:
         server.shutdown()
     print(f"\n结果: {passed} 通过, {failed} 失败")
